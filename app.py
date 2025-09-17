@@ -12,14 +12,16 @@ import streamlit as st
 from pytubefix import YouTube
 from pytubefix.exceptions import VideoUnavailable
 
-
 st.set_page_config(page_title="YouTube → MP4+MP3+WAV", layout="centered")
+
+# ----- Helpers -----
 
 def sanitize(name: str) -> str:
     name = (name or "video").strip()
     return "".join(c if c.isalnum() or c in " ._-()" else "_" for c in name)
 
 def pick_streams(yt: YouTube):
+    # meilleure vidéo (mp4 si possible) + meilleur audio (m4a/mp4 si possible)
     v = (yt.streams.filter(adaptive=True, only_video=True, file_extension="mp4")
                   .order_by("resolution").desc().first())
     if not v:
@@ -34,10 +36,12 @@ def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 def merge_to_mp4(video_path: str, audio_path: str, out_path: str):
+    # 1) tentative sans ré-encodage
     cmd_copy = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path, "-c", "copy", out_path]
     res = subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if res.returncode == 0:
         return
+    # 2) fallback: ré-encodage H.264/AAC pour garantir un MP4 lisible
     cmd_x264 = [
         "ffmpeg", "-y",
         "-i", video_path, "-i", audio_path,
@@ -55,7 +59,31 @@ def make_wav(mp4_path: str, wav_path: str):
     cmd = ["ffmpeg", "-y", "-i", mp4_path, "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", wav_path]
     subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
+# ----- UI -----
+
 st.title("YouTube → MP4 (HD) + MP3 + WAV")
+
+# Sidebar: option OAuth + explications
+st.sidebar.header("Options")
+default_oauth = str(os.getenv("USE_OAUTH", "0")).lower() in ("1", "true", "yes")
+use_oauth = st.sidebar.checkbox("Activer OAuth", value=default_oauth)
+
+with st.sidebar.expander("Aide OAuth"):
+    st.markdown(
+        """
+**Quand activer OAuth ?**
+- Pour accéder à des vidéos nécessitant une connexion (restriction d’âge, non répertoriées accessibles à votre compte, membres-only).
+- Pour réduire certains blocages côté YouTube.
+
+**Comment cela fonctionne ?**
+- Si activé, `pytubefix` lance un flux d’authentification Google.
+- Selon l’environnement, il peut soit ouvrir une page Google, soit demander d’aller sur `https://www.google.com/device` et saisir un code.
+
+**Remarques Streamlit Cloud**
+- Sur Streamlit Cloud, le code du device flow peut apparaître dans les logs du serveur, pas dans la page.
+- Si l’authentification ne peut pas être validée depuis l’interface, décochez OAuth (contenus publics uniquement) ou exécutez en local avec OAuth activé.
+        """
+    )
 
 url = st.text_input("URL YouTube", placeholder="https://www.youtube.com/watch?v=XXXXXXXXXXX")
 
@@ -71,16 +99,16 @@ if st.button("Télécharger (MP4+MP3+WAV)"):
         st.error("Veuillez entrer une URL.")
     else:
         try:
-            with st.spinner("Analyse de la vidéo et authentification OAuth si nécessaire…"):
+            with st.spinner("Analyse de la vidéo et authentification si nécessaire..."):
                 yt = YouTube(
                     url.strip(),
-                    use_oauth=True,          # OAuth activé
-                    allow_oauth_cache=True   # mise en cache des tokens
+                    use_oauth=use_oauth,
+                    allow_oauth_cache=True
                 )
                 base = sanitize(yt.title)
 
             with tempfile.TemporaryDirectory() as tmp:
-                with st.spinner("Téléchargement des flux vidéo et audio…"):
+                with st.spinner("Téléchargement des flux vidéo et audio..."):
                     v, a = pick_streams(yt)
                     if not v or not a:
                         st.error("Impossible de trouver des flux vidéo/audio adaptatifs.")
@@ -89,17 +117,17 @@ if st.button("Télécharger (MP4+MP3+WAV)"):
                     a_path = a.download(output_path=tmp, filename=base + "_a")
 
                 mp4_path = os.path.join(tmp, base + ".mp4")
-                with st.spinner("Fusion vidéo+audio en MP4…"):
+                with st.spinner("Fusion vidéo+audio en MP4..."):
                     merge_to_mp4(v_path, a_path, mp4_path)
 
                 mp3_path = os.path.join(tmp, base + ".mp3")
                 wav_path = os.path.join(tmp, base + ".wav")
-                with st.spinner("Génération MP3…"):
+                with st.spinner("Génération MP3..."):
                     make_mp3(mp4_path, mp3_path)
-                with st.spinner("Génération WAV…"):
+                with st.spinner("Génération WAV..."):
                     make_wav(mp4_path, wav_path)
 
-                with st.spinner("Préparation du fichier ZIP…"):
+                with st.spinner("Préparation du fichier ZIP..."):
                     buf = io.BytesIO()
                     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
                         z.write(mp4_path, arcname=os.path.basename(mp4_path))
