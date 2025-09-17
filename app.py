@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+from urllib.error import HTTPError
 
 import streamlit as st
 from pytubefix import YouTube
@@ -21,7 +22,6 @@ def sanitize(name: str) -> str:
     return "".join(c if c.isalnum() or c in " ._-()" else "_" for c in name)
 
 def pick_streams(yt: YouTube):
-    # meilleure vidéo (mp4 si possible) + meilleur audio (m4a/mp4 si possible)
     v = (yt.streams.filter(adaptive=True, only_video=True, file_extension="mp4")
                   .order_by("resolution").desc().first())
     if not v:
@@ -36,12 +36,10 @@ def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 def merge_to_mp4(video_path: str, audio_path: str, out_path: str):
-    # 1) tentative sans ré-encodage
     cmd_copy = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path, "-c", "copy", out_path]
     res = subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if res.returncode == 0:
         return
-    # 2) fallback: ré-encodage H.264/AAC pour garantir un MP4 lisible
     cmd_x264 = [
         "ffmpeg", "-y",
         "-i", video_path, "-i", audio_path,
@@ -59,39 +57,58 @@ def make_wav(mp4_path: str, wav_path: str):
     cmd = ["ffmpeg", "-y", "-i", mp4_path, "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", wav_path]
     subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
+def ytdlp_download_mp4(url: str, tmpdir: str, base: str, cookies_path: str | None = None) -> str:
+    """Télécharge un MP4 fusionné via yt-dlp. Renvoie le chemin du MP4."""
+    otemplate = os.path.join(tmpdir, base + ".%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "-f", "bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "--no-playlist",
+        "-o", otemplate,
+        url,
+    ]
+    if cookies_path:
+        cmd[1:1] = ["--cookies", cookies_path]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        raise RuntimeError("yt-dlp a échoué:\n" + proc.stdout.decode(errors="ignore"))
+    mp4_path = os.path.join(tmpdir, base + ".mp4")
+    if not os.path.exists(mp4_path):
+        raise FileNotFoundError("MP4 non trouvé après yt-dlp")
+    return mp4_path
+
 # ----- UI -----
 
 st.title("YouTube → MP4 (HD) + MP3 + WAV")
 
-# Sidebar: option OAuth + explications
-st.sidebar.header("Options")
+# Sidebar: contrôles Cloud
+st.sidebar.header("Options d'accès")
 default_oauth = str(os.getenv("USE_OAUTH", "0")).lower() in ("1", "true", "yes")
 use_oauth = st.sidebar.checkbox("Activer OAuth", value=default_oauth)
 
-with st.sidebar.expander("Aide OAuth"):
+proxy_url = st.sidebar.text_input("Proxy HTTP(S) (facultatif)", placeholder="http://user:pass@host:port")
+enable_fallback = st.sidebar.checkbox("Activer le fallback yt-dlp (auto si 403)", value=True)
+cookies_file = st.sidebar.file_uploader("cookies.txt pour yt-dlp (facultatif)", type=["txt"])
+
+with st.sidebar.expander("Aide / Pourquoi 403 en Cloud"):
     st.markdown(
         """
-**Quand activer OAuth ?**
-- Pour accéder à des vidéos nécessitant une connexion (restriction d’âge, non répertoriées accessibles à votre compte, membres-only).
-- Pour réduire certains blocages côté YouTube.
-
-**Comment cela fonctionne ?**
-- Si activé, `pytubefix` lance un flux d’authentification Google.
-- Selon l’environnement, il peut soit ouvrir une page Google, soit demander d’aller sur `https://www.google.com/device` et saisir un code.
-
-**Remarques Streamlit Cloud**
-- Sur Streamlit Cloud, le code du device flow peut apparaître dans les logs du serveur, pas dans la page.
-- Si l’authentification ne peut pas être validée depuis l’interface, décochez OAuth (contenus publics uniquement) ou exécutez en local avec OAuth activé.
+En local l'IP est résidentielle : souvent OK. En Cloud, l'IP peut être filtrée (403).
+Solutions possibles :
+- Activer OAuth et compléter l'authentification (le code peut s'afficher dans les logs Cloud).
+- Utiliser un proxy HTTP(S) (résidentiel) pour les requêtes.
+- Activer le fallback `yt-dlp` et, si besoin, fournir un `cookies.txt` exporté de votre navigateur.
         """
     )
 
 url = st.text_input("URL YouTube", placeholder="https://www.youtube.com/watch?v=XXXXXXXXXXX")
 
-# 1) Afficher la vidéo en premier
+# Aperçu vidéo
 if url.strip():
     st.video(url.strip())
 
-# 2) Un seul bouton qui fait tout
+# Un seul bouton qui fait tout
 if st.button("Télécharger (MP4+MP3+WAV)"):
     if not ffmpeg_available():
         st.error("ffmpeg introuvable. Installez-le et relancez.")
@@ -99,11 +116,14 @@ if st.button("Télécharger (MP4+MP3+WAV)"):
         st.error("Veuillez entrer une URL.")
     else:
         try:
+            # Tentative pytubefix (avec éventuellement proxy + OAuth)
+            proxies = {"http": proxy_url, "https": proxy_url} if proxy_url.strip() else None
             with st.spinner("Analyse de la vidéo et authentification si nécessaire..."):
                 yt = YouTube(
                     url.strip(),
                     use_oauth=use_oauth,
-                    allow_oauth_cache=True
+                    allow_oauth_cache=True,
+                    proxies=proxies
                 )
                 base = sanitize(yt.title)
 
@@ -111,8 +131,7 @@ if st.button("Télécharger (MP4+MP3+WAV)"):
                 with st.spinner("Téléchargement des flux vidéo et audio..."):
                     v, a = pick_streams(yt)
                     if not v or not a:
-                        st.error("Impossible de trouver des flux vidéo/audio adaptatifs.")
-                        st.stop()
+                        raise RuntimeError("Flux vidéo/audio introuvables.")
                     v_path = v.download(output_path=tmp, filename=base + "_v")
                     a_path = a.download(output_path=tmp, filename=base + "_a")
 
@@ -138,14 +157,48 @@ if st.button("Télécharger (MP4+MP3+WAV)"):
                     st.session_state["zip_name"] = f"{base}.zip"
 
             st.success("Préparation terminée.")
-        except VideoUnavailable:
-            st.error("Vidéo indisponible. Vérifiez l’URL et les restrictions.")
-        except subprocess.CalledProcessError as e:
-            st.error(f"Erreur FFmpeg: {e}")
-        except Exception as e:
-            st.error(f"Erreur: {e}")
 
-# 3) Bouton de téléchargement unique, indépendant des reruns
+        except Exception as e:
+            msg = str(e)
+            is_403 = ("403" in msg) or (isinstance(e, HTTPError) and getattr(e, "code", None) == 403)
+            if enable_fallback and is_403:
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        base = sanitize("video")
+                        # cookies optionnels pour yt-dlp
+                        cookies_path = None
+                        if cookies_file is not None:
+                            cookies_path = os.path.join(tmp, "cookies.txt")
+                            with open(cookies_path, "wb") as f:
+                                f.write(cookies_file.read())
+
+                        with st.spinner("Fallback yt-dlp: téléchargement MP4..."):
+                            mp4_path = ytdlp_download_mp4(url.strip(), tmp, base, cookies_path)
+
+                        mp3_path = os.path.join(tmp, base + ".mp3")
+                        wav_path = os.path.join(tmp, base + ".wav")
+                        with st.spinner("Génération MP3..."):
+                            make_mp3(mp4_path, mp3_path)
+                        with st.spinner("Génération WAV..."):
+                            make_wav(mp4_path, wav_path)
+
+                        with st.spinner("Préparation du fichier ZIP..."):
+                            buf = io.BytesIO()
+                            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                                z.write(mp4_path, arcname=os.path.basename(mp4_path))
+                                z.write(mp3_path, arcname=os.path.basename(mp3_path))
+                                z.write(wav_path, arcname=os.path.basename(wav_path))
+                            buf.seek(0)
+                            st.session_state["zip_bytes"] = buf.getvalue()
+                            st.session_state["zip_name"] = f"{base}.zip"
+
+                    st.success("Préparation terminée via yt-dlp.")
+                except Exception as e2:
+                    st.error(f"Echec du fallback yt-dlp: {e2}")
+            else:
+                st.error(f"Erreur: {e}")
+
+# Bouton de téléchargement unique, indépendant des reruns
 if "zip_bytes" in st.session_state and "zip_name" in st.session_state:
     st.download_button(
         label="Télécharger le fichier zip",
