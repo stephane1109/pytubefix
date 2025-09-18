@@ -1,193 +1,152 @@
 # python -m streamlit run app.py
 
 
-import os
 import io
+import math
+import os
 import shutil
+import struct
 import subprocess
+import sys
 import tempfile
-import zipfile
-from urllib.error import HTTPError
+import wave
 
 import streamlit as st
-from pytubefix import YouTube
-from pytubefix.exceptions import VideoUnavailable
 
-st.set_page_config(page_title="YouTube → MP4+MP3+WAV", layout="centered")
+st.set_page_config(page_title="Test FFmpeg (Streamlit Cloud)", layout="centered")
+st.title("Test FFmpeg")
 
-# ----------------- Helpers -----------------
+# ----------------- utilitaires -----------------
 
-def sanitize(name: str) -> str:
-    name = (name or "video").strip()
-    return "".join(c if c.isalnum() or c in " ._-()" else "_" for c in name)
+def which(cmd: str) -> str | None:
+    return shutil.which(cmd)
 
-def pick_streams(yt: YouTube):
-    v = (yt.streams.filter(adaptive=True, only_video=True, file_extension="mp4")
-                  .order_by("resolution").desc().first())
-    if not v:
-        v = yt.streams.filter(adaptive=True, only_video=True).order_by("resolution").desc().first()
-    a = (yt.streams.filter(only_audio=True, file_extension="mp4")
-                  .order_by("abr").desc().first())
-    if not a:
-        a = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
-    return v, a
+def run(cmd: list[str], timeout: int = 20):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError as e:
+        return 127, "", str(e)
+    except Exception as e:
+        return 1, "", str(e)
 
-def ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
+def gen_sine_wav(path: str, seconds: float = 1.0, freq: float = 440.0, rate: int = 44100):
+    # WAV PCM 16-bit stéréo, sinusoïde simple
+    n = int(seconds * rate)
+    amp = 0.5
+    with wave.open(path, "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)  # 16-bit
+        w.setframerate(rate)
+        for i in range(n):
+            sample = int(amp * 32767.0 * math.sin(2 * math.pi * freq * (i / rate)))
+            frame = struct.pack("<hh", sample, sample)
+            w.writeframes(frame)
 
-def merge_to_mp4(video_path: str, audio_path: str, out_path: str):
-    # tentative sans ré-encodage
-    cmd_copy = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path, "-c", "copy", out_path]
-    res = subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    if res.returncode == 0:
-        return
-    # fallback H.264/AAC
-    cmd_x264 = [
-        "ffmpeg", "-y",
-        "-i", video_path, "-i", audio_path,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-        "-c:a", "aac", "-b:a", "192k",
-        out_path
-    ]
-    subprocess.run(cmd_x264, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+def make_download_button(label: str, filepath: str, mime: str):
+    with open(filepath, "rb") as f:
+        st.download_button(
+            label=label,
+            data=f.read(),
+            file_name=os.path.basename(filepath),
+            mime=mime,
+            use_container_width=True,
+        )
 
-def make_mp3(mp4_path: str, mp3_path: str):
-    cmd = ["ffmpeg", "-y", "-i", mp4_path, "-vn", "-c:a", "libmp3lame", "-q:a", "2", mp3_path]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+# ----------------- affichage infos -----------------
 
-def make_wav(mp4_path: str, wav_path: str):
-    cmd = ["ffmpeg", "-y", "-i", mp4_path, "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", wav_path]
-    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+col1, col2 = st.columns(2)
+with col1:
+    st.markdown("**Plateforme**")
+    st.code(sys.platform)
+    st.markdown("**Python**")
+    st.code(sys.version.split()[0])
+with col2:
+    st.markdown("**ffmpeg dans le PATH**")
+    st.code(which("ffmpeg") or "introuvable")
+    st.markdown("**ffprobe dans le PATH**")
+    st.code(which("ffprobe") or "introuvable")
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def run_download_job(url: str, use_oauth: bool, proxy_url: str | None):
-    if not ffmpeg_available():
-        raise RuntimeError("ffmpeg introuvable. Installez-le puis relancez.")
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+st.markdown("**PATH**")
+st.code(os.environ.get("PATH", ""))
 
-    yt = YouTube(
-        url.strip(),
-        use_oauth=use_oauth,
-        allow_oauth_cache=True,
-        proxies=proxies
-    )
-    base = sanitize(yt.title)
+st.markdown("---")
+st.subheader("Test 1 : ffmpeg -version")
+code, out, err = run(["ffmpeg", "-hide_banner", "-version"], timeout=8)
+st.write(f"Code de retour : {code}")
+if code == 0:
+    st.success("ffmpeg détecté")
+    st.code(out.splitlines()[0] if out else "")
+else:
+    st.error("ffmpeg non détecté ou non exécutable dans cet environnement.")
+    if err:
+        st.markdown("**Erreur**")
+        st.code(err)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        v, a = pick_streams(yt)
-        if not v or not a:
-            raise RuntimeError("Flux vidéo/audio introuvables.")
-        v_path = v.download(output_path=tmp, filename=base + "_v")
-        a_path = a.download(output_path=tmp, filename=base + "_a")
+st.markdown("---")
+st.subheader("Test 2 : conversions réelles (si ffmpeg disponible)")
 
-        mp4_path = os.path.join(tmp, base + ".mp4")
-        merge_to_mp4(v_path, a_path, mp4_path)
+if code != 0:
+    st.info("Les conversions ne sont pas exécutées car ffmpeg n'est pas disponible.")
+else:
+    if st.button("Lancer les tests de conversion"):
+        logs = []
+        with tempfile.TemporaryDirectory() as td:
+            wav_in = os.path.join(td, "test_in.wav")
+            gen_sine_wav(wav_in, seconds=1.0, freq=440.0, rate=44100)
+            logs.append(f"Généré : {wav_in}")
 
-        mp3_path = os.path.join(tmp, base + ".mp3")
-        make_mp3(mp4_path, mp3_path)
+            # 2A) WAV -> MP3 (libmp3lame), puis fallback en AAC/M4A
+            mp3_out = os.path.join(td, "test_out.mp3")
+            code1, out1, err1 = run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                                     "-i", wav_in, "-vn", "-c:a", "libmp3lame", "-q:a", "2", mp3_out])
+            if code1 == 0 and os.path.exists(mp3_out):
+                st.success("Audio: conversion WAV → MP3 réussie (libmp3lame).")
+                make_download_button("Télécharger test_out.mp3", mp3_out, "audio/mpeg")
+            else:
+                logs.append("MP3 échoué ou indisponible, tentative AAC/M4A...")
+                m4a_out = os.path.join(td, "test_out.m4a")
+                code1b, out1b, err1b = run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                                            "-i", wav_in, "-vn", "-c:a", "aac", "-b:a", "128k", m4a_out])
+                if code1b == 0 and os.path.exists(m4a_out):
+                    st.success("Audio: conversion WAV → M4A/AAC réussie.")
+                    make_download_button("Télécharger test_out.m4a", m4a_out, "audio/mp4")
+                else:
+                    st.error("Audio: échec des conversions MP3 et AAC.")
+                    st.code((err1 or "") + "\n" + (err1b or ""))
 
-        wav_path = os.path.join(tmp, base + ".wav")
-        make_wav(mp4_path, wav_path)
+            # 2B) Génération d'une vidéo 1s MP4 (image unie + silence)
+            mp4_out = os.path.join(td, "test_out.mp4")
+            # tentative H.264 + AAC via lavfi (color + anullsrc)
+            cmd_h264 = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                        "-f", "lavfi", "-i", "color=c=red:s=320x240:d=1",
+                        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                        "-shortest",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "128k",
+                        mp4_out]
+            c2, o2, e2 = run(cmd_h264, timeout=20)
+            if c2 == 0 and os.path.exists(mp4_out):
+                st.success("Vidéo: génération MP4 (H.264 + AAC) réussie.")
+                make_download_button("Télécharger test_out.mp4", mp4_out, "video/mp4")
+            else:
+                # fallback: mpeg4 + aac (toujours en MP4)
+                cmd_mpeg4 = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                             "-f", "lavfi", "-i", "color=c=red:s=320x240:d=1",
+                             "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                             "-shortest",
+                             "-c:v", "mpeg4",
+                             "-c:a", "aac", "-b:a", "128k",
+                             mp4_out]
+                c3, o3, e3 = run(cmd_mpeg4, timeout=20)
+                if c3 == 0 and os.path.exists(mp4_out):
+                    st.warning("Vidéo: H.264 indisponible, génération MP4 en mpeg4 + AAC réussie.")
+                    make_download_button("Télécharger test_out.mp4", mp4_out, "video/mp4")
+                else:
+                    st.error("Vidéo: échec des deux tentatives (H.264 et mpeg4).")
+                    st.code((e2 or "") + "\n" + (e3 or ""))
 
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            z.write(mp4_path, arcname=os.path.basename(mp4_path))
-            z.write(mp3_path, arcname=os.path.basename(mp3_path))
-            z.write(wav_path, arcname=os.path.basename(wav_path))
-        buf.seek(0)
-        return buf.getvalue(), f"{base}.zip"
-
-# ----------------- State init -----------------
-
-if "run_job" not in st.session_state:
-    st.session_state.run_job = False
-if "processing" not in st.session_state:
-    st.session_state.processing = False
-if "result" not in st.session_state:
-    st.session_state.result = None
-if "error" not in st.session_state:
-    st.session_state.error = None
-if "last_params" not in st.session_state:
-    st.session_state.last_params = None
-
-# ----------------- UI -----------------
-
-st.title("YouTube → MP4 (HD) + MP3 + WAV")
-
-with st.form("form", clear_on_submit=False):
-    url = st.text_input("URL YouTube", placeholder="https://www.youtube.com/watch?v=XXXXXXXXXXX")
-    if url.strip():
-        st.video(url.strip())
-
-    c1, c2 = st.columns(2)
-    with c1:
-        default_oauth = str(os.getenv("USE_OAUTH", "0")).lower() in ("1", "true", "yes")
-        use_oauth = st.checkbox("Activer OAuth", value=default_oauth)
-    with c2:
-        proxy_url = st.text_input("Proxy HTTP(S) (facultatif)", placeholder="http://user:pass@host:port")
-
-    st.markdown(
-        """
-**Boucles évitées**
-- Le téléchargement est encapsulé et mis en cache pour la paire (URL, OAuth, Proxy).
-- Le bouton ne lance le traitement qu'une fois et un verrou interne empêche les relances.
-
-**OAuth**
-- À activer si la vidéo requiert connexion/âge. Sur certains hébergeurs, un code à saisir peut être demandé sur https://www.google.com/device.
-        """
-    )
-
-    submit = st.form_submit_button("Préparer le téléchargement", disabled=st.session_state.processing)
-
-# Armer l'exécution à la soumission
-if submit:
-    st.session_state.run_job = True
-    st.session_state.processing = True
-    st.session_state.result = None
-    st.session_state.error = None
-    st.session_state.last_params = (url.strip(), bool(use_oauth), proxy_url.strip() or None)
-
-# Exécuter exactement une fois si armé
-if st.session_state.run_job and st.session_state.processing and st.session_state.last_params:
-    u, o, p = st.session_state.last_params
-    if not u:
-        st.session_state.error = "Veuillez entrer une URL."
-        st.session_state.processing = False
-        st.session_state.run_job = False
-    else:
-        try:
-            with st.spinner("Préparation en cours..."):
-                zip_bytes, zip_name = run_download_job(u, o, p)
-            st.session_state.result = (zip_bytes, zip_name)
-        except VideoUnavailable:
-            st.session_state.error = "Vidéo indisponible. Vérifiez l'URL et les restrictions."
-        except HTTPError as e:
-            st.session_state.error = f"HTTPError {getattr(e, 'code', '?')}: {getattr(e, 'reason', '')}"
-        except subprocess.CalledProcessError as e:
-            st.session_state.error = f"Erreur FFmpeg: {e}"
-        except Exception as e:
-            st.session_state.error = f"Erreur: {e}"
-        finally:
-            # on désarme sans st.rerun()
-            st.session_state.processing = False
-            st.session_state.run_job = False
-
-# Affichage résultat ou erreur (ne relance rien)
-if st.session_state.result:
-    zip_bytes, zip_name = st.session_state.result
-    st.success("Préparation terminée.")
-    st.download_button(
-        "Télécharger le fichier zip",
-        data=zip_bytes,
-        file_name=zip_name,
-        mime="application/zip",
-        use_container_width=True,
-    )
-
-if st.session_state.error:
-    st.error(st.session_state.error)
-    st.info("Si cela persiste en Cloud: activez OAuth et/ou renseignez un proxy HTTP(S), ou testez en local.")
-
-if st.button("Réinitialiser"):
-    for k in ("run_job", "processing", "result", "error", "last_params"):
-        st.session_state.pop(k, None)
+        st.markdown("---")
+        st.markdown("Journal")
+        if logs:
+            st.code("\n".join(logs))
